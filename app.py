@@ -6,6 +6,7 @@ writing retrieval or prompting logic here, it belongs in src/rag_pipeline.py.
 """
 
 import logging
+import hashlib
 
 import streamlit as st
 from langchain_groq import ChatGroq
@@ -36,31 +37,58 @@ def init_session_state():
         "messages": [],       # list[HumanMessage | AIMessage] for the LLM
         "display_messages": [],  # list[dict] with role/content/citations for the UI
         "summary": None,
+        "processed_source_name": None,
+        "processed_chunks_count": None,
+        "active_input_fingerprint": None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
 
 
+def get_input_fingerprint(file_bytes: bytes | None, raw_text: str | None, input_type: str) -> str | None:
+    if file_bytes:
+        return f"{input_type}:{hashlib.sha256(file_bytes).hexdigest()}"
+    if raw_text and raw_text.strip():
+        return f"{input_type}:{hashlib.sha256(raw_text.strip().encode('utf-8')).hexdigest()}"
+    return None
+
+
 def process_uploaded_document():
     st.subheader("1. Load a document")
-    input_type = st.radio("Input type", ["PDF", "Image", "Text"], horizontal=True)
+    input_type = st.radio("Input type", ["PDF", "Image", "Text"], horizontal=True, key="input_type")
 
     file_bytes, raw_text, source_name = None, None, "uploaded_document"
 
     if input_type == "PDF":
-        uploaded = st.file_uploader("Upload a PDF", type=["pdf"])
+        uploaded = st.file_uploader("Upload a PDF", type=["pdf"], key="pdf_uploader")
         if uploaded:
-            file_bytes, source_name = uploaded.read(), uploaded.name
+            file_bytes, source_name = uploaded.getvalue(), uploaded.name
     elif input_type == "Image":
-        uploaded = st.file_uploader("Upload an image", type=["png", "jpg", "jpeg"])
+        uploaded = st.file_uploader("Upload an image", type=["png", "jpg", "jpeg"], key="image_uploader")
         if uploaded:
-            file_bytes, source_name = uploaded.read(), uploaded.name
+            file_bytes, source_name = uploaded.getvalue(), uploaded.name
     else:
-        raw_text = st.text_area("Paste text", height=200)
+        raw_text = st.text_area("Paste text", height=200, key="text_input")
         source_name = "pasted_text"
 
-    if st.button("Process document", type="primary", disabled=not (file_bytes or raw_text)):
+    can_process = bool(file_bytes) or bool(raw_text and raw_text.strip())
+    current_input_fingerprint = get_input_fingerprint(file_bytes, raw_text, input_type.lower())
+    has_active_session = st.session_state.indexes is not None and st.session_state.active_input_fingerprint is not None
+    has_new_unprocessed_input = (
+        has_active_session
+        and current_input_fingerprint is not None
+        and current_input_fingerprint != st.session_state.active_input_fingerprint
+    )
+
+    if st.button("Process document", type="primary", disabled=not can_process, key="process_document_button"):
+        if (
+            st.session_state.indexes is not None
+            and current_input_fingerprint is not None
+            and current_input_fingerprint == st.session_state.active_input_fingerprint
+        ):
+            st.info("This input is already active. Continuing the current session.")
+            return
         with st.spinner("Extracting and indexing..."):
             try:
                 text = normalize_input(
@@ -72,9 +100,20 @@ def process_uploaded_document():
                 st.session_state.messages = []
                 st.session_state.display_messages = []
                 st.session_state.summary = None
+                st.session_state.processed_source_name = source_name
+                st.session_state.processed_chunks_count = len(docs)
+                st.session_state.active_input_fingerprint = current_input_fingerprint
                 st.success(f"Indexed {len(docs)} chunks from '{source_name}'.")
             except DocumentProcessingError as exc:
                 st.error(str(exc))
+
+    if st.session_state.indexes is not None:
+        st.caption(
+            f"✅ Document ready: {st.session_state.processed_source_name} "
+            f"({st.session_state.processed_chunks_count} chunks indexed)"
+        )
+        if has_new_unprocessed_input:
+            st.caption("A different input is selected. Click **Process document** to start a new session.")
 
 
 def chat_tab():
