@@ -3,7 +3,7 @@ from unittest.mock import Mock, patch
 
 from langchain.docstore.document import Document
 
-from src.rag_pipeline import Reranker, answer_question, rewrite_query
+from src.rag_pipeline import Reranker, answer_question, check_rag_health, rewrite_query
 
 
 class RewriteQueryTests(unittest.TestCase):
@@ -65,6 +65,50 @@ class AnswerQuestionTests(unittest.TestCase):
         self.assertEqual(len(result["citations"]), 1)
         self.assertEqual(result["citations"][0]["source"], "doc.pdf")
         self.assertEqual(result["citations"][0]["chunk_id"], 3)
+
+
+class RagHealthTests(unittest.TestCase):
+    def test_check_rag_health_returns_timings_and_status(self):
+        retriever = Mock()
+        docs = [
+            Document(page_content="Clause A", metadata={"source": "doc.pdf", "chunk_id": 3}),
+            Document(page_content="Clause B", metadata={"source": "doc.pdf", "chunk_id": 4}),
+        ]
+        retriever.invoke.return_value = docs
+
+        reranker = Mock()
+        reranker.rerank.return_value = docs[:1]
+
+        fake_chain = Mock()
+        fake_chain.invoke.return_value = Mock(content="Health answer")
+        fake_prompt = Mock()
+        fake_prompt.__or__ = Mock(return_value=fake_chain)
+        llm = Mock()
+
+        with patch("src.rag_pipeline.rewrite_query", return_value="standalone"), patch(
+            "src.rag_pipeline._ANSWER_PROMPT", fake_prompt
+        ), patch("src.rag_pipeline.time.perf_counter", side_effect=[0.0, 0.01, 0.02, 0.03, 0.05, 0.06, 0.08, 0.09, 0.12, 0.15]):
+            result = check_rag_health(
+                llm=llm,
+                reranker=reranker,
+                ensemble_retriever=retriever,
+                question="probe question",
+                chat_history=[],
+            )
+
+        self.assertTrue(result["healthy"])
+        self.assertEqual(result["query"], "probe question")
+        self.assertEqual(result["standalone_query"], "standalone")
+        self.assertEqual(result["answer"], "Health answer")
+        self.assertEqual(result["warnings"], [])
+        self.assertEqual(result["counts"]["candidates"], 2)
+        self.assertEqual(result["counts"]["reranked_docs"], 1)
+        self.assertEqual(result["counts"]["citations"], 1)
+        self.assertEqual(result["timings_ms"]["rewrite"], 10.0)
+        self.assertEqual(result["timings_ms"]["retrieval"], 20.0)
+        self.assertEqual(result["timings_ms"]["rerank"], 20.0)
+        self.assertEqual(result["timings_ms"]["generation"], 30.0)
+        self.assertEqual(result["timings_ms"]["total"], 150.0)
 
 
 if __name__ == "__main__":
