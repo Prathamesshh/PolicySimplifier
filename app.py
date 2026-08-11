@@ -14,7 +14,7 @@ from langchain_core.messages import HumanMessage, AIMessage
 
 from src.config import settings, validate_settings
 from src.document_processor import normalize_input, chunk_text, DocumentProcessingError
-from src.rag_pipeline import build_indexes, Reranker, answer_question, summarize_document
+from src.rag_pipeline import build_indexes, Reranker, answer_question, check_rag_health, summarize_document
 
 logging.basicConfig(level=logging.INFO)
 st.set_page_config(page_title="PolicyQA", page_icon="📄", layout="wide")
@@ -40,6 +40,7 @@ def init_session_state():
         "processed_source_name": None,
         "processed_chunks_count": None,
         "active_input_fingerprint": None,
+        "rag_health_report": None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -174,6 +175,52 @@ def summary_tab():
         st.markdown(st.session_state.summary)
 
 
+def health_tab():
+    st.subheader("4. RAG health and performance")
+    if st.session_state.indexes is None:
+        st.info("Load and process a document first.")
+        return
+
+    if st.button("Run health check"):
+        with st.spinner("Checking retrieval, reranking, and generation..."):
+            st.session_state.rag_health_report = check_rag_health(
+                llm=get_llm(),
+                reranker=get_reranker(),
+                ensemble_retriever=st.session_state.indexes["ensemble_retriever"],
+            )
+
+    report = st.session_state.rag_health_report
+    if not report:
+        st.caption("Run the health check to see pipeline timings and warnings.")
+        return
+
+    status_label = "Healthy" if report["healthy"] else "Needs attention"
+    st.metric("Status", status_label)
+
+    timing_columns = st.columns(4)
+    timing_columns[0].metric("Rewrite ms", f"{report['timings_ms']['rewrite']:.1f}")
+    timing_columns[1].metric("Retrieve ms", f"{report['timings_ms']['retrieval']:.1f}")
+    timing_columns[2].metric("Rerank ms", f"{report['timings_ms']['rerank']:.1f}")
+    timing_columns[3].metric("Generate ms", f"{report['timings_ms']['generation']:.1f}")
+
+    st.caption(
+        f"Candidates: {report['counts']['candidates']} | "
+        f"Reranked: {report['counts']['reranked_docs']} | "
+        f"Citations: {report['counts']['citations']} | "
+        f"Total: {report['timings_ms']['total']:.1f} ms"
+    )
+
+    if report["warnings"]:
+        st.warning("; ".join(report["warnings"]))
+    else:
+        st.success("No health warnings detected.")
+
+    with st.expander("Probe answer"):
+        st.markdown(report["answer"])
+        st.caption(f"Probe question: {report['query']}")
+        st.caption(f"Standalone query: {report['standalone_query']}")
+
+
 def main():
     st.title("📄 PolicyQA")
     st.caption("Multilingual, multimodal document Q&A with hybrid retrieval and cited answers.")
@@ -187,11 +234,13 @@ def main():
     init_session_state()
     process_uploaded_document()
     st.divider()
-    tab1, tab2 = st.tabs(["💬 Chat", "📝 Summary"])
+    tab1, tab2, tab3 = st.tabs(["💬 Chat", "📝 Summary", "🔎 Health"])
     with tab1:
         chat_tab()
     with tab2:
         summary_tab()
+    with tab3:
+        health_tab()
 
 
 if __name__ == "__main__":
