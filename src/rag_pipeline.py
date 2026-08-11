@@ -159,6 +159,10 @@ def _format_context(documents: List[Document]) -> str:
     return "\n\n".join(blocks)
 
 
+def _elapsed_ms(started_at: float) -> float:
+    return round((time.perf_counter() - started_at) * 1000, 3)
+
+
 def answer_question(
     llm: ChatGroq,
     reranker: Reranker,
@@ -206,18 +210,18 @@ def check_rag_health(
 
     rewrite_started_at = time.perf_counter()
     standalone_query = rewrite_query(llm, probe_question, history)
-    timings_ms["rewrite"] = (time.perf_counter() - rewrite_started_at) * 1000
+    timings_ms["rewrite"] = _elapsed_ms(rewrite_started_at)
 
     retrieval_started_at = time.perf_counter()
     candidates = ensemble_retriever.invoke(standalone_query)[: settings.rerank_candidate_k]
-    timings_ms["retrieval"] = (time.perf_counter() - retrieval_started_at) * 1000
+    timings_ms["retrieval"] = _elapsed_ms(retrieval_started_at)
     counts["candidates"] = len(candidates)
     if not candidates:
         warnings.append("Retriever returned no candidates.")
 
     rerank_started_at = time.perf_counter()
     top_docs = reranker.rerank(standalone_query, candidates, settings.final_top_k)
-    timings_ms["rerank"] = (time.perf_counter() - rerank_started_at) * 1000
+    timings_ms["rerank"] = _elapsed_ms(rerank_started_at)
     counts["reranked_docs"] = len(top_docs)
     if candidates and not top_docs:
         warnings.append("Reranker returned no documents.")
@@ -226,7 +230,7 @@ def check_rag_health(
     generation_started_at = time.perf_counter()
     chain = _ANSWER_PROMPT | llm
     response = chain.invoke({"context": context, "question": probe_question})
-    timings_ms["generation"] = (time.perf_counter() - generation_started_at) * 1000
+    timings_ms["generation"] = _elapsed_ms(generation_started_at)
 
     answer = response.content.strip()
     counts["citations"] = len(top_docs)
@@ -235,7 +239,7 @@ def check_rag_health(
     if not answer:
         warnings.append("Answer generation returned an empty response.")
 
-    timings_ms["total"] = (time.perf_counter() - started_at) * 1000
+    timings_ms["total"] = _elapsed_ms(started_at)
 
     healthy = not warnings and bool(answer) and bool(top_docs)
 
