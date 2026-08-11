@@ -14,6 +14,7 @@ Every design choice here has a stated tradeoff — see README.md's
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List, TypedDict
 
 from langchain.docstore.document import Document
@@ -43,6 +44,16 @@ class AnswerResult(TypedDict):
     answer: str
     citations: List[Citation]
     standalone_query: str  # the rewritten query actually used for retrieval
+
+
+class RagHealthResult(TypedDict):
+    healthy: bool
+    query: str
+    standalone_query: str
+    answer: str
+    warnings: List[str]
+    timings_ms: Dict[str, float]
+    counts: Dict[str, int]
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +186,68 @@ def answer_question(
     ]
 
     return {"answer": response.content, "citations": citations, "standalone_query": standalone_query}
+
+
+def check_rag_health(
+    llm: ChatGroq,
+    reranker: Reranker,
+    ensemble_retriever: EnsembleRetriever,
+    question: str = "What is the document mainly about?",
+    chat_history: List[BaseMessage] | None = None,
+) -> RagHealthResult:
+    """Run the full RAG flow and return a compact health/performance report."""
+    probe_question = question.strip() or "What is the document mainly about?"
+    history = chat_history or []
+    warnings: List[str] = []
+    timings_ms: Dict[str, float] = {}
+    counts: Dict[str, int] = {}
+
+    started_at = time.perf_counter()
+
+    rewrite_started_at = time.perf_counter()
+    standalone_query = rewrite_query(llm, probe_question, history)
+    timings_ms["rewrite"] = (time.perf_counter() - rewrite_started_at) * 1000
+
+    retrieval_started_at = time.perf_counter()
+    candidates = ensemble_retriever.invoke(standalone_query)[: settings.rerank_candidate_k]
+    timings_ms["retrieval"] = (time.perf_counter() - retrieval_started_at) * 1000
+    counts["candidates"] = len(candidates)
+    if not candidates:
+        warnings.append("Retriever returned no candidates.")
+
+    rerank_started_at = time.perf_counter()
+    top_docs = reranker.rerank(standalone_query, candidates, settings.final_top_k)
+    timings_ms["rerank"] = (time.perf_counter() - rerank_started_at) * 1000
+    counts["reranked_docs"] = len(top_docs)
+    if candidates and not top_docs:
+        warnings.append("Reranker returned no documents.")
+
+    context = _format_context(top_docs)
+    generation_started_at = time.perf_counter()
+    chain = _ANSWER_PROMPT | llm
+    response = chain.invoke({"context": context, "question": probe_question})
+    timings_ms["generation"] = (time.perf_counter() - generation_started_at) * 1000
+
+    answer = response.content.strip()
+    counts["citations"] = len(top_docs)
+    counts["context_chars"] = len(context)
+
+    if not answer:
+        warnings.append("Answer generation returned an empty response.")
+
+    timings_ms["total"] = (time.perf_counter() - started_at) * 1000
+
+    healthy = not warnings and bool(answer) and bool(top_docs)
+
+    return {
+        "healthy": healthy,
+        "query": probe_question,
+        "standalone_query": standalone_query,
+        "answer": answer,
+        "warnings": warnings,
+        "timings_ms": timings_ms,
+        "counts": counts,
+    }
 
 
 # ---------------------------------------------------------------------------
